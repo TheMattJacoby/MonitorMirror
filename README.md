@@ -2,6 +2,10 @@
 
 A Windows tray app that mirrors another monitor onto your main screen with a hotkey, so you can see the screen behind you without turning around.
 
+![The rear monitor shown picture-in-picture on the main screen](docs/images/pip.png)
+
+<sub>Images in this README are illustrations, not screenshots.</sub>
+
 ## Features
 
 - **Hotkey mirror.** Show a live copy of another monitor full-screen or picture-in-picture.
@@ -12,6 +16,8 @@ A Windows tray app that mirrors another monitor onto your main screen with a hot
 - **Tray menu** for all settings, plus a *Start with Windows* toggle.
 - **Auto-update takeover.** Starting a newer version closes the older running copy.
 
+<img src="docs/images/captured.png" alt="The mirror with the cursor captured, framed by a blue border" width="640">
+
 ## Hotkeys
 
 | Hotkey | Action |
@@ -21,6 +27,8 @@ A Windows tray app that mirrors another monitor onto your main screen with a hot
 | `Esc` / click | Hide the mirror |
 
 Left-click the tray icon to toggle the mirror; right-click for settings.
+
+<img src="docs/images/tray-menu.png" alt="Tray menu with the Color submenu open" width="620">
 
 ## Setup
 
