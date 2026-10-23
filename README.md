@@ -1,3 +1,5 @@
+<img src="docs/images/icon.png" width="72" alt="Monitor Mirror icon">
+
 # Monitor Mirror
 
 A Windows tray app that mirrors another monitor onto your main screen with a hotkey, so you can see the screen behind you without turning around.
