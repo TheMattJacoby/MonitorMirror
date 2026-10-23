@@ -34,7 +34,6 @@ import tkinter as tk
 import webbrowser
 from ctypes import wintypes
 from pathlib import Path
-from tkinter import messagebox
 
 import cv2
 import mss
@@ -50,7 +49,7 @@ except Exception:          # not installed, or no Desktop Duplication on this ma
     HAVE_DXCAM = False
 
 APP_NAME = "Monitor Mirror"
-APP_VERSION = "2.3"
+APP_VERSION = "2.4"
 REPO_URL = "https://github.com/TheMattJacoby/MonitorMirror"
 MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x0001, 0x0002, 0x4000
 HOTKEYS = {
@@ -101,6 +100,11 @@ BAR_H = 34
 BAR_BG, BAR_FG = "#1f2937", "#e5e7eb"
 BTN_HOVER, CLOSE_HOVER = "#374151", "#dc2626"
 BORDER_W = 4
+
+# Toasts: same look in all of these tray apps; the accent matches the app's icon.
+TOAST_BG, TOAST_FG = "#1e293b", "#f1f5f9"
+TOAST_ACCENT = "#60a5fa"
+TOAST_MS, TOAST_WARN_MS = 2500, 4500   # normal notices / warnings
 
 SETTINGS_PATH = Path(os.environ.get("APPDATA", Path.home())) / "MonitorMirror" / "settings.json"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -215,6 +219,11 @@ class BITMAPINFOHEADER(ctypes.Structure):
                 ("biClrImportant", wintypes.DWORD)]
 
 
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+
 class BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
 
@@ -254,6 +263,9 @@ if os.name == "nt":
     _proto(user32.FindWindowW, W.HWND, W.LPCWSTR, W.LPCWSTR)
     _proto(user32.PostMessageW, W.BOOL, W.HWND, W.UINT, W.WPARAM, W.LPARAM)
     _proto(user32.MessageBoxW, ctypes.c_int, W.HWND, W.LPCWSTR, W.LPCWSTR, W.UINT)
+    _proto(user32.GetCursorPos, W.BOOL, ctypes.POINTER(W.POINT))
+    _proto(user32.MonitorFromPoint, W.HMONITOR, W.POINT, W.DWORD)
+    _proto(user32.GetMonitorInfoW, W.BOOL, W.HMONITOR, ctypes.POINTER(MONITORINFO))
 else:
     kernel32 = user32 = gdi32 = None
 
@@ -307,6 +319,16 @@ def cursor_info():
 def cursor_position():
     info = cursor_info()
     return (info[0], info[1]) if info else None
+
+
+def cursor_work_area():
+    """(left, top, right, bottom) of the work area (minus taskbar) of the screen the mouse is on."""
+    pt = wintypes.POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
+    mi = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+    user32.GetMonitorInfoW(user32.MonitorFromPoint(pt, 2), ctypes.byref(mi))   # 2 = nearest
+    r = mi.rcWork
+    return r.left, r.top, r.right, r.bottom
 
 
 def clip_cursor(m):
@@ -1005,6 +1027,7 @@ class App:
         self.capturer = Capturer(self)
 
         self.events = queue.Queue()
+        self.toast_win = None
         self.root = tk.Tk()
         self.root.title(INSTANCE_WINDOW_TITLE)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)   # a newer launch asks us to quit
@@ -1059,6 +1082,8 @@ class App:
         save_settings(s)
         self.mirror.configure()
         self._refresh_tray()
+        if key in ("source", "target"):
+            self.toast(self._status())
 
     def set_pip_pos(self, x, y):
         self.settings["pip_pos"] = [x, y]
@@ -1068,8 +1093,9 @@ class App:
     def toggle_startup(self):
         try:
             set_startup(not startup_enabled())
+            self.toast("Will start with Windows" if startup_enabled() else "Won't start with Windows")
         except OSError as e:
-            messagebox.showerror(APP_NAME, f"Couldn't change startup setting:\n{e}")
+            self.toast(f"Couldn't change the startup setting: {e}", TOAST_WARN_MS)
         self.icon.update_menu()
 
     def open_settings(self):
@@ -1198,6 +1224,32 @@ class App:
             Item("Quit", lambda icon, item: self.post(self.quit)),
         )
 
+    def toast(self, text, ms=TOAST_MS):
+        """Small notice in the bottom-right corner of the screen the mouse is on.
+        Same look and behavior in Desk Layouts and Monitor Mirror; click to dismiss."""
+        if self.toast_win is not None:
+            try:
+                self.toast_win.destroy()
+            except Exception:
+                pass
+        t = tk.Toplevel(self.root, bg=TOAST_BG)
+        t.overrideredirect(True)
+        t.attributes("-topmost", True)
+        try:
+            t.attributes("-alpha", 0.96)
+        except Exception:
+            pass
+        tk.Frame(t, bg=TOAST_ACCENT, width=4).pack(side="left", fill="y")
+        tk.Label(t, text=text, bg=TOAST_BG, fg=TOAST_FG, font=("Segoe UI", 10),
+                 padx=14, pady=10, justify="left", wraplength=460).pack(side="left")
+        for w in (t, *t.winfo_children()):
+            w.bind("<Button-1>", lambda e: t.destroy())
+        t.update_idletasks()
+        l, top, r, b = cursor_work_area()
+        t.geometry(f"+{r - t.winfo_reqwidth() - 24}+{b - t.winfo_reqheight() - 24}")
+        t.after(ms, t.destroy)
+        self.toast_win = t
+
     def _poll(self):
         try:
             while True:
@@ -1207,13 +1259,10 @@ class App:
                 elif kind == "hotkey-failed":
                     self.mirror._refresh_chrome()
                     self.icon.update_menu()
-                    extra = ("\nCursor capture is turned off, since it needs its release hotkey."
+                    extra = (" Cursor capture is off, since it needs its release hotkey."
                              if CAPTURE_KEY in payload else "")
-                    messagebox.showwarning(
-                        APP_NAME,
-                        f"Couldn't register {' and '.join(payload)} - another app may be using "
-                        f"{'them' if len(payload) > 1 else 'it'}.{extra}\n"
-                        "You can still open the mirror from the tray icon.")
+                    self.toast(f"Hotkey unavailable (in use by another app?): {', '.join(payload)}.{extra} "
+                               "You can still use the tray icon.", TOAST_WARN_MS)
         except queue.Empty:
             pass
         self.root.after(50, self._poll)
@@ -1222,6 +1271,8 @@ class App:
         threading.Thread(target=hotkey_listener, args=(self,), daemon=True).start()
         threading.Thread(target=self.icon.run, daemon=True).start()
         self._poll()
+        self.root.after(300, lambda: self.toast(
+            f"{APP_NAME} v{APP_VERSION} running · {TOGGLE_KEY} to show Monitor {self.settings['source']}"))
         self.root.mainloop()
 
 
