@@ -1,0 +1,6 @@
+mss>=9.0
+pillow>=10.0
+pystray>=0.19
+numpy>=1.24
+opencv-python>=4.8
+dxcam>=0.0.5
