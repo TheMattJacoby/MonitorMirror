@@ -26,10 +26,12 @@ import ctypes
 import json
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from ctypes import wintypes
 from pathlib import Path
 from tkinter import messagebox
@@ -48,7 +50,8 @@ except Exception:          # not installed, or no Desktop Duplication on this ma
     HAVE_DXCAM = False
 
 APP_NAME = "Monitor Mirror"
-APP_VERSION = "2.2"
+APP_VERSION = "2.3"
+REPO_URL = "https://github.com/TheMattJacoby/MonitorMirror"
 MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x0001, 0x0002, 0x4000
 HOTKEYS = {
     1: ("Ctrl+Alt+M", MOD_CONTROL | MOD_ALT, ord("M"), "toggle"),
@@ -597,13 +600,25 @@ def draw_cursor(img, x, y, s, hcursor):
 
 
 def make_tray_image():
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    """Tray icon: dark badge with a monitor showing a blue picture-in-picture inset.
+    Same family as Desk Layouts' icon (same badge and monitor, teal accent)."""
+    S = 256
+    grad = Image.new("RGBA", (S, S))
+    gd = ImageDraw.Draw(grad)
+    top, bottom = (51, 65, 85), (30, 41, 59)
+    for y in range(S):
+        t = y / (S - 1)
+        gd.line([(0, y), (S, y)], fill=tuple(int(a + (b - a) * t) for a, b in zip(top, bottom)) + (255,))
+    mask = Image.new("L", (S, S), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((8, 8, S - 8, S - 8), 56, fill=255)
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    img.paste(grad, (0, 0), mask)
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle((3, 6, 41, 34), radius=4, fill=(110, 110, 120, 255))
-    d.rounded_rectangle((19, 20, 61, 49), radius=4, fill=(37, 99, 235, 255),
-                        outline=(255, 255, 255, 255), width=3)
-    d.rectangle((36, 49, 44, 55), fill=(255, 255, 255, 255))
-    d.rectangle((29, 55, 51, 59), fill=(255, 255, 255, 255))
+    frame = (226, 232, 240)
+    d.rounded_rectangle((40, 52, 216, 168), 14, outline=frame, width=16)     # monitor
+    d.rectangle((119, 168, 137, 190), fill=frame)                            # stand
+    d.rounded_rectangle((90, 188, 166, 202), 7, fill=frame)                  # foot
+    d.rounded_rectangle((116, 74, 194, 122), 6, fill=(96, 165, 250))         # blue PiP inset
     return img
 
 
@@ -995,8 +1010,19 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.quit)   # a newer launch asks us to quit
         self.root.withdraw()
         self.mirror = Mirror(self.root, self)
-        self.icon = pystray.Icon("monitor_mirror", make_tray_image(),
-                                 f"{APP_NAME} {APP_VERSION} ({TOGGLE_KEY})", self._build_menu())
+        self.icon = pystray.Icon("monitor_mirror", make_tray_image(), self._tooltip(), self._build_menu())
+
+    def _status(self, item=None):
+        s = self.settings
+        return f"Mirroring Monitor {s['source']} → Monitor {s['target']}"
+
+    def _tooltip(self):
+        s = self.settings
+        return f"{APP_NAME} v{APP_VERSION} · Monitor {s['source']} → {s['target']}"
+
+    def _refresh_tray(self):
+        self.icon.title = self._tooltip()
+        self.icon.update_menu()
 
     def _fix_monitor_choices(self):
         n = len(self.monitors)
@@ -1032,7 +1058,7 @@ class App:
             self.mirror.base = None
         save_settings(s)
         self.mirror.configure()
-        self.icon.update_menu()
+        self._refresh_tray()
 
     def set_pip_pos(self, x, y):
         self.settings["pip_pos"] = [x, y]
@@ -1045,6 +1071,10 @@ class App:
         except OSError as e:
             messagebox.showerror(APP_NAME, f"Couldn't change startup setting:\n{e}")
         self.icon.update_menu()
+
+    def open_settings(self):
+        save_settings(self.settings)
+        subprocess.Popen(["notepad.exe", str(SETTINGS_PATH)])
 
     def quit(self):
         self.mirror.hide()
@@ -1090,12 +1120,16 @@ class App:
         real_on = lambda item: s["show_cursor"] and s["cursor_style"] == "real"
         can_capture = lambda item: self.capture_available
 
+        # Standard layout shared with Desk Layouts:
+        # name + version, status / main actions / app settings /
+        # Start with Windows, settings file, GitHub / Quit.
         return Menu(
             note(f"{APP_NAME}  v{APP_VERSION}"),
+            note(self._status),
             Menu.SEPARATOR,
-            Item(f"Show / hide   ({TOGGLE_KEY})",
+            Item(f"Show / hide\t{TOGGLE_KEY}",
                  lambda icon, item: self.post(self.mirror.toggle), default=True),
-            Item(f"Capture cursor   ({CAPTURE_KEY})",
+            Item(f"Capture cursor\t{CAPTURE_KEY}",
                  lambda icon, item: self.post(self.mirror.capture), enabled=can_capture),
             Menu.SEPARATOR,
             Item("Mirror monitor", monitors_menu("source")),
@@ -1103,29 +1137,22 @@ class App:
             Item("Display", Menu(
                 radio("Full screen", "mode", "fullscreen"),
                 radio("Picture-in-picture", "mode", "pip"),
-            )),
-            Item("Picture-in-picture size", Menu(
-                *[radio(f"{round(v * 100)}%", "pip_scale", v) for v in SCALES],
                 Menu.SEPARATOR,
-                note("Tip: scroll over the window to resize"),
-            ), enabled=pip_only),
-            Item("Picture-in-picture position", Menu(
-                corner("Top left", "top-left"),
-                corner("Top right", "top-right"),
-                corner("Bottom left", "bottom-left"),
-                corner("Bottom right", "bottom-right"),
-                Item("Custom (dragged)", lambda icon, item: None,
-                     checked=lambda item: bool(s["pip_pos"]), radio=True, enabled=False),
-                Menu.SEPARATOR,
-                note("Tip: drag the window to move it"),
-            ), enabled=pip_only),
-            Item("Performance", Menu(
-                *[radio(f"{f} fps", "fps", f) for f in FPS_OPTIONS],
-                Menu.SEPARATOR,
-                radio("GPU capture (recommended)", "engine", "gpu",
-                      enabled=lambda item: HAVE_DXCAM),
-                radio("Compatibility capture (GDI)", "engine", "gdi"),
-                Item(self._engine_status, lambda icon, item: None, enabled=False),
+                Item("Picture-in-picture size", Menu(
+                    *[radio(f"{round(v * 100)}%", "pip_scale", v) for v in SCALES],
+                    Menu.SEPARATOR,
+                    note("Tip: scroll over the window to resize"),
+                ), enabled=pip_only),
+                Item("Picture-in-picture position", Menu(
+                    corner("Top left", "top-left"),
+                    corner("Top right", "top-right"),
+                    corner("Bottom left", "bottom-left"),
+                    corner("Bottom right", "bottom-right"),
+                    Item("Custom (dragged)", lambda icon, item: None,
+                         checked=lambda item: bool(s["pip_pos"]), radio=True, enabled=False),
+                    Menu.SEPARATOR,
+                    note("Tip: drag the window to move it"),
+                ), enabled=pip_only),
             )),
             Item("Color  (cursor + capture border)", Menu(
                 *[radio(name, "cursor_color", key) for key, (name, _) in CURSOR_COLORS.items()],
@@ -1153,10 +1180,21 @@ class App:
                 Menu.SEPARATOR,
                 toggle("Center the cursor when closing the mirror", "center_on_close"),
             )),
+            Item("Performance", Menu(
+                *[radio(f"{f} fps", "fps", f) for f in FPS_OPTIONS],
+                Menu.SEPARATOR,
+                radio("GPU capture (recommended)", "engine", "gpu",
+                      enabled=lambda item: HAVE_DXCAM),
+                radio("Compatibility capture (GDI)", "engine", "gdi"),
+                Item(self._engine_status, lambda icon, item: None, enabled=False),
+            )),
             Menu.SEPARATOR,
             Item("Start with Windows",
                  lambda icon, item: self.post(self.toggle_startup),
                  checked=lambda item: startup_enabled()),
+            Item("Open settings file", lambda icon, item: self.post(self.open_settings)),
+            Item("View on GitHub", lambda icon, item: webbrowser.open(REPO_URL)),
+            Menu.SEPARATOR,
             Item("Quit", lambda icon, item: self.post(self.quit)),
         )
 
