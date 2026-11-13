@@ -17,6 +17,7 @@ A Windows tray app that mirrors another monitor onto your main screen with a hot
 - **GPU capture.** Uses Desktop Duplication (dxcam) for smooth frame rates, with automatic GDI fallback.
 - **Tray menu** for all settings, plus a *Start with Windows* toggle.
 - **Auto-update takeover.** Starting a newer version closes the older running copy.
+- **Survives sleep.** Re-detects monitors after sleep, wake, or a screen switching off, and keeps mirroring the right monitor even if Windows renumbers them. If the app ever crashes, it restarts itself.
 
 <img src="docs/images/captured.png" alt="The mirror with the cursor captured, framed by a blue border" width="640">
 
@@ -42,11 +43,19 @@ pip install -r requirements.txt
 
 Then double-click `mirror.pyw`. The `.pyw` extension runs it without a console window.
 
-**Tip:** Run it from your cloned repo folder (e.g. `C:\Dev\MonitorMirror`) before turning on *Start with Windows*. The startup entry points at the file's exact path, and updating is then just a `git pull`.
+**Tip:** Run it from your cloned repo folder (e.g. `C:\Dev\MonitorMirror`) before turning on *Start with Windows*. The startup entry follows whichever copy you last opened, and updating is then just a `git pull`. If Windows has turned the entry off (Task Manager → Startup apps), the tray menu says so and one click turns it back on.
 
 ## Data
 
-Settings are stored in `%APPDATA%\MonitorMirror\settings.json`.
+Everything lives in `%APPDATA%\MonitorMirror\`:
+
+| File | What's in it |
+|---|---|
+| `settings.json` | Your settings |
+| `mirror.log` | Startups, sleep/wake and display changes, handled errors |
+| `crash.log` | Crashes and automatic restarts |
+
+Tray → *Open log folder* opens it.
 
 ## License
 

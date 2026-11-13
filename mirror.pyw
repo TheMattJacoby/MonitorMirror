@@ -18,7 +18,11 @@ Capture runs on the GPU (Windows Desktop Duplication) and only does work when
 the mirrored screen or the cursor actually changes. If GPU capture is unavailable
 it falls back to the older GDI method automatically.
 
-Settings are saved to %APPDATA%\\MonitorMirror\\settings.json
+Reliability: the app runs under a tiny supervisor that restarts it if it ever
+crashes (e.g. a graphics-driver hiccup while monitors sleep), and it re-detects
+displays after sleep, wake, or monitors switching off and on.
+
+Settings and logs live in %APPDATA%\\MonitorMirror\\ (settings.json, mirror.log, crash.log)
 """
 import argparse
 import atexit
@@ -35,6 +39,68 @@ import webbrowser
 from ctypes import wintypes
 from pathlib import Path
 
+APP_NAME = "Monitor Mirror"
+APP_VERSION = "2.5"
+DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "MonitorMirror"
+CRASH_LOG = DATA_DIR / "crash.log"
+STARTUP_DELAY = 8          # seconds to wait after sign-in before starting
+
+
+def _supervise():
+    """Run the real app in a child process and restart it if it ever crashes, so a
+    graphics-driver or display hiccup (sleep, monitors switching off) can't take the
+    mirror down for good. Only a clean Quit (exit code 0) stops it."""
+    import subprocess
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if CRASH_LOG.exists() and CRASH_LOG.stat().st_size > 1_000_000:
+            CRASH_LOG.replace(DATA_DIR / "crash.old.log")
+    except OSError:
+        pass
+    exe = Path(sys.executable)
+    pyw = exe.with_name("pythonw.exe")
+    cmd = [str(pyw if pyw.exists() else exe), str(Path(__file__).resolve()), "--child"]
+
+    def note(text):
+        try:
+            with open(CRASH_LOG, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  [supervisor] {text}\n")
+        except OSError:
+            pass
+
+    if "--startup" in sys.argv:
+        note(f"started at sign-in; waiting {STARTUP_DELAY}s for the desktop")
+        time.sleep(STARTUP_DELAY)
+
+    crashes = []
+    while True:
+        note(f"launching v{APP_VERSION}")
+        with open(CRASH_LOG, "a", encoding="utf-8") as err:
+            rc = subprocess.call(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=err, creationflags=0x08000000)   # CREATE_NO_WINDOW
+        if rc == 0:
+            note("app quit normally")
+            return
+        now = time.time()
+        crashes = [t for t in crashes if now - t < 120] + [now]
+        note(f"app exited unexpectedly (code {rc} / 0x{rc & 0xFFFFFFFF:08X}); "
+             f"crash {len(crashes)} in the last 2 minutes")
+        if len(crashes) >= 5:
+            note("giving up after repeated crashes")
+            ctypes.windll.user32.MessageBoxW(
+                None, "Monitor Mirror keeps crashing, so it has stopped restarting itself.\n\n"
+                f"Details are in:\n{CRASH_LOG}", APP_NAME, 0x30)
+            return
+        time.sleep(min(2 * len(crashes), 10))
+
+
+if __name__ == "__main__" and os.name == "nt" and not ({"--child", "--list"} & set(sys.argv)):
+    _supervise()
+    sys.exit(0)
+
+import logging
+import logging.handlers
+
 import cv2
 import mss
 import numpy as np
@@ -48,8 +114,7 @@ except Exception:          # not installed, or no Desktop Duplication on this ma
     dxcam = None
     HAVE_DXCAM = False
 
-APP_NAME = "Monitor Mirror"
-APP_VERSION = "2.4"
+log = logging.getLogger("mirror")
 REPO_URL = "https://github.com/TheMattJacoby/MonitorMirror"
 MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x0001, 0x0002, 0x4000
 HOTKEYS = {
@@ -106,8 +171,9 @@ TOAST_BG, TOAST_FG = "#1e293b", "#f1f5f9"
 TOAST_ACCENT = "#60a5fa"
 TOAST_MS, TOAST_WARN_MS = 2500, 4500   # normal notices / warnings
 
-SETTINGS_PATH = Path(os.environ.get("APPDATA", Path.home())) / "MonitorMirror" / "settings.json"
+SETTINGS_PATH = DATA_DIR / "settings.json"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+APPROVED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
 
 WM_HOTKEY = 0x0312
 WM_CLOSE = 0x0010
@@ -165,15 +231,29 @@ def save_settings(s):
 def startup_command():
     exe = Path(sys.executable)
     pyw = exe.with_name("pythonw.exe")
-    return f'"{pyw if pyw.exists() else exe}" "{Path(__file__).resolve()}"'
+    return f'"{pyw if pyw.exists() else exe}" "{Path(__file__).resolve()}" --startup'
 
 
-def startup_enabled():
+def registered_startup_command():
     import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
-            winreg.QueryValueEx(k, APP_NAME)
-            return True
+            return winreg.QueryValueEx(k, APP_NAME)[0]
+    except OSError:
+        return None
+
+
+def startup_enabled():
+    return registered_startup_command() is not None
+
+
+def startup_blocked():
+    """True if the entry exists but is switched off in Task Manager > Startup apps."""
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, APPROVED_KEY) as k:
+            data = winreg.QueryValueEx(k, APP_NAME)[0]
+            return bool(data) and bool(data[0] & 1)
     except OSError:
         return False
 
@@ -188,6 +268,52 @@ def set_startup(enabled):
                 winreg.DeleteValue(k, APP_NAME)
             except FileNotFoundError:
                 pass
+    try:   # clear (or remove) any "disabled" flag Task Manager may have set
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, APPROVED_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            if enabled:
+                winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_BINARY, bytes([2] + [0] * 11))
+            else:
+                try:
+                    winreg.DeleteValue(k, APP_NAME)
+                except FileNotFoundError:
+                    pass
+    except OSError:
+        pass
+
+
+def repair_startup_entry():
+    """If Start with Windows is on but points at an old file location or old format,
+    point it at this file. Handles moving or re-downloading the script."""
+    try:
+        current = registered_startup_command()
+        if current is not None and current != startup_command():
+            set_startup(True)
+            log.info("Updated the startup entry: %s -> %s", current, startup_command())
+    except OSError:
+        log.exception("Couldn't repair the startup entry")
+
+
+def setup_logging():
+    import faulthandler
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        DATA_DIR / "mirror.log", maxBytes=500_000, backupCount=1, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+    global _fault_file
+    try:   # native crashes (e.g. inside the graphics driver) dump a traceback here
+        _fault_file = open(CRASH_LOG, "a", encoding="utf-8")
+        faulthandler.enable(_fault_file)
+    except OSError:
+        pass
+    sys.excepthook = lambda *exc: log.error("Unhandled error", exc_info=exc)
+    threading.excepthook = lambda a: log.error(
+        "Thread %s crashed", a.thread.name if a.thread else "?",
+        exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
+
+
+_fault_file = None
 
 
 # ----------------------------------------------------------------- win32 plumbing
@@ -292,18 +418,17 @@ def acquire_single_instance():
     Returns False only if an older copy that doesn't support this is still running."""
     global _instance_mutex
     asked = False
-    for _ in range(50):                       # up to ~5 seconds
+    for _ in range(100):                      # up to ~10 seconds
         handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
         if ctypes.get_last_error() != 183:    # ERROR_ALREADY_EXISTS
             _instance_mutex = handle
             return True
         kernel32.CloseHandle(handle)
-        if not asked:
+        if not asked:          # the other copy may still be starting; keep looking
             hwnd = user32.FindWindowW("TkTopLevel", INSTANCE_WINDOW_TITLE)
-            if not hwnd:
-                return False
-            user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
-            asked = True
+            if hwnd:
+                user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+                asked = True
         time.sleep(0.1)
     return False
 
@@ -380,6 +505,21 @@ def dxgi_output_for(mon):
     return None
 
 
+def rebuild_gpu_outputs():
+    """dxcam lists the graphics outputs once at import; after sleep or a monitor
+    switching off/on those objects are stale, so build a fresh list."""
+    if not HAVE_DXCAM:
+        return
+    try:
+        old = vars(dxcam).get("__factory")
+        if old is not None:
+            old.clean_up()
+        dxcam.Singleton._instances.pop(dxcam.DXFactory, None)
+        vars(dxcam)["__factory"] = dxcam.DXFactory()
+    except Exception:
+        log.exception("Couldn't rebuild the GPU output list")
+
+
 class Capturer:
     """GPU capture via Desktop Duplication (only returns a frame when the screen changed),
     with GDI capture as a fallback. Frames are RGB numpy arrays."""
@@ -401,6 +541,18 @@ class Capturer:
         self._release_cam()
         self.last = None
         self.retry_at = 0.0
+
+    def displays_changed(self, settle=1.0):
+        """Call after sleep/wake or when monitors appear, disappear or move."""
+        self._release_cam()
+        try:
+            self.sct.close()
+        except Exception:
+            pass
+        self.sct = mss.mss()
+        rebuild_gpu_outputs()
+        self.last = None
+        self.retry_at = time.monotonic() + settle     # give the driver a moment
 
     def _release_cam(self):
         if self.cam is not None:
@@ -654,6 +806,7 @@ class Mirror:
         self.photo = None
         self.job = None
         self.bar_state = None      # (state, border width) currently applied
+        self.box = (0, 0, 960, 540)  # replaced by configure() once the monitors are known
         self.geom = None           # (offset_x, offset_y, scale) of the picture inside the window
         self.base = None           # scaled frame without the cursor
         self.base_layout = None
@@ -705,11 +858,11 @@ class Mirror:
 
     @property
     def src(self):
-        return self.app.monitors[self.app.settings["source"] - 1]
+        return self.app.monitor(self.app.settings["source"])
 
     @property
     def dst(self):
-        return self.app.monitors[self.app.settings["target"] - 1]
+        return self.app.monitor(self.app.settings["target"])
 
     @property
     def is_pip(self):
@@ -717,6 +870,8 @@ class Mirror:
 
     def configure(self):
         s, m, src = self.app.settings, self.dst, self.src
+        if m is None or src is None:       # a monitor is asleep/unplugged; keep the old layout
+            return
         if self.is_pip:
             w = int(m["width"] * s["pip_scale"])
             h = int(w * src["height"] / src["width"])
@@ -755,10 +910,11 @@ class Mirror:
                 left = s["edge_release"] - len(self._bumps)
                 how += (f" or bump an edge {s['edge_release']}×" if left == s["edge_release"]
                         else f" or bump {left} more time{'s' if left != 1 else ''}")
-            text = f"●  Cursor captured on Monitor {s['source']}   ·   {how} to release"
+            text = f"●  Cursor captured on Monitor {s['source'] or '?'}   ·   {how} to release"
         else:
             bg, fg = BAR_BG, BAR_FG
-            text = f"Monitor {s['source']}   ·   Esc to close"
+            text = (f"Monitor {s['source']}   ·   Esc to close" if self.src
+                    else "Mirrored monitor isn't connected right now (asleep or off)   ·   Esc to close")
             if self.app.capture_available:
                 text += "   ·   click to capture cursor"
             self.close_btn.pack(side="right", fill="y")
@@ -819,6 +975,8 @@ class Mirror:
             if self.captured:          # capture_on_open already did it
                 return
         src = self.src
+        if src is None:
+            return
         tx, ty = src["left"] + src["width"] // 2, src["top"] + src["height"] // 2
         if at is None:
             at = cursor_position()
@@ -848,7 +1006,8 @@ class Mirror:
     def _center_cursor(self):
         """Put the cursor in the middle of the monitor the mirror is shown on."""
         dst = self.dst
-        user32.SetCursorPos(dst["left"] + dst["width"] // 2, dst["top"] + dst["height"] // 2)
+        if dst is not None:
+            user32.SetCursorPos(dst["left"] + dst["width"] // 2, dst["top"] + dst["height"] // 2)
 
     def _edge_watch(self):
         """While captured, count bumps against the monitor's edges; enough quick bumps
@@ -857,9 +1016,9 @@ class Mirror:
         if not self.captured:
             return
         need = self.app.settings["edge_release"]
-        pos = cursor_position() if need else None
+        src = self.src
+        pos = cursor_position() if need and src else None
         if pos:
-            src = self.src
             x, y = pos[0] - src["left"], pos[1] - src["top"]
             dist = min(x, src["width"] - 1 - x, y, src["height"] - 1 - y)
             now = time.monotonic()
@@ -880,9 +1039,9 @@ class Mirror:
 
     def _mirror_to_source(self, px, py):
         """Mirror-window screen point -> point on the source monitor (None if outside the picture)."""
-        if not self.geom:
-            return None
         src = self.src
+        if not self.geom or src is None:
+            return None
         ox, oy, scale = self.geom
         sx = (px - self.box[0] - ox) / scale
         sy = (py - self.box[1] - oy) / scale
@@ -963,8 +1122,24 @@ class Mirror:
     def _tick(self):
         if not self.visible:
             return
+        try:
+            delay = self._render_frame()
+        except Exception:
+            log.exception("Frame update failed; resetting capture")
+            self.app.warn("Capture hiccup · reconnecting to the monitor", "frame")
+            self.app.capturer.displays_changed(settle=1.0)
+            self.base = None
+            delay = 500
+        self.job = self.win.after(delay, self._tick)
+
+    def _render_frame(self):
+        """Draw one frame; returns how many ms to wait before the next."""
         start = time.perf_counter()
         s, src = self.app.settings, self.src
+        if src is None:                    # mirrored monitor asleep/unplugged: wait for it
+            if self.captured:
+                self.release()
+            return 1000
         if self.captured:
             clip_cursor(src)            # Windows can drop the clip (focus changes etc.); re-assert it
 
@@ -1012,50 +1187,136 @@ class Mirror:
 
         self._update_bar()
         elapsed_ms = (time.perf_counter() - start) * 1000
-        self.job = self.win.after(max(1, int(1000 / s["fps"] - elapsed_ms)), self._tick)
+        return max(1, int(1000 / s["fps"] - elapsed_ms))
 
 
 # ----------------------------------------------------------------- app + tray
 
+def list_monitors():
+    with mss.mss() as sct:
+        return [dict(m) for m in sct.monitors[1:]]       # [0] is the whole virtual desktop
+
+
+def rect_of(m):
+    return [m["left"], m["top"], m["width"], m["height"]]
+
+
 class App:
     def __init__(self):
-        with mss.mss() as sct:
-            self.monitors = sct.monitors[1:]       # [0] is the whole virtual desktop
+        self.monitors = list_monitors()
         self.settings = load_settings()
         self._fix_monitor_choices()
         self.capture_available = True
         self.capturer = Capturer(self)
+        self._last_watch = time.time()
+        self._warned = {}
 
         self.events = queue.Queue()
         self.toast_win = None
         self.root = tk.Tk()
         self.root.title(INSTANCE_WINDOW_TITLE)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)   # a newer launch asks us to quit
+        self.root.report_callback_exception = (
+            lambda *exc: log.error("Error in UI callback", exc_info=exc))
         self.root.withdraw()
         self.mirror = Mirror(self.root, self)
         self.icon = pystray.Icon("monitor_mirror", make_tray_image(), self._tooltip(), self._build_menu())
 
     def _status(self, item=None):
         s = self.settings
+        if not self.monitor(s["source"]):
+            return "Mirrored monitor not connected · waiting for it"
         return f"Mirroring Monitor {s['source']} → Monitor {s['target']}"
 
     def _tooltip(self):
         s = self.settings
+        if not self.monitor(s["source"]):
+            return f"{APP_NAME} v{APP_VERSION} · mirrored monitor not connected"
         return f"{APP_NAME} v{APP_VERSION} · Monitor {s['source']} → {s['target']}"
+
+    def warn(self, text, key, every=60):
+        """Warning toast, at most once per `every` seconds for the same kind of problem."""
+        now = time.time()
+        if now - self._warned.get(key, 0) >= every:
+            self._warned[key] = now
+            self.toast(text, TOAST_WARN_MS)
 
     def _refresh_tray(self):
         self.icon.title = self._tooltip()
         self.icon.update_menu()
 
+    def monitor(self, number):
+        """Monitor by its 1-based number, or None if it isn't connected right now."""
+        return self.monitors[number - 1] if 1 <= number <= len(self.monitors) else None
+
     def _fix_monitor_choices(self):
-        n = len(self.monitors)
+        """Monitors are remembered by position, not just by number, because Windows can
+        renumber them after sleep. A remembered monitor that's missing right now (asleep,
+        switched off) is left alone rather than swapped for another one."""
         s = self.settings
-        if not 1 <= s["source"] <= n:
-            s["source"] = n
-        if not 1 <= s["target"] <= n:
-            s["target"] = 1
-        if s["source"] == s["target"] and n > 1:
-            s["target"] = 1 if s["source"] != 1 else 2
+        remembered = False
+        for key in ("source", "target"):
+            rect = s.get(f"{key}_rect")
+            if not rect:
+                continue
+            remembered = True
+            s[key] = 0                     # 0 = not connected right now
+            for i, m in enumerate(self.monitors, 1):
+                if rect_of(m) == rect:
+                    s[key] = i
+        if not remembered:                 # first run: pick sensible defaults
+            n = len(self.monitors)
+            if not 1 <= s["source"] <= n:
+                s["source"] = n
+            if not 1 <= s["target"] <= n:
+                s["target"] = 1
+            if s["source"] == s["target"] and n > 1:
+                s["target"] = 1 if s["source"] != 1 else 2
+        self._remember_monitor_rects()
+
+    def _remember_monitor_rects(self):
+        for key in ("source", "target"):
+            m = self.monitor(self.settings[key])
+            if m is not None:
+                self.settings[f"{key}_rect"] = rect_of(m)
+
+    # ---- sleep / wake / monitors switching off and on
+
+    def _watch_displays(self):
+        try:
+            now = time.time()
+            resumed = now - self._last_watch > 20      # this loop was frozen: the PC slept
+            self._last_watch = now
+            current = list_monitors()
+            if resumed or [rect_of(m) for m in current] != [rect_of(m) for m in self.monitors]:
+                self._displays_changed(current, resumed)
+        except Exception:
+            log.exception("Display check failed")
+        self.root.after(2000, self._watch_displays)
+
+    def _displays_changed(self, current, resumed):
+        log.info("%s; monitors now: %s", "Woke from sleep" if resumed else "Display layout changed",
+                 [rect_of(m) for m in current])
+        had_source = self.monitor(self.settings["source"]) is not None
+        self.mirror.release()               # the cursor clip rectangle may be stale
+        self.monitors = current
+        self._fix_monitor_choices()
+        has_source = self.monitor(self.settings["source"]) is not None
+        save_settings(self.settings)
+        self.capturer.displays_changed(settle=3.0 if resumed else 1.5)
+        self.mirror.base = None
+        self.mirror.configure()
+        self.mirror._refresh_chrome()
+        try:
+            self.icon.menu = self._build_menu()   # monitor list may have changed
+            self._refresh_tray()
+        except Exception:
+            log.exception("Couldn't refresh the tray menu")
+        if had_source and not has_source:
+            self.toast("Mirrored monitor isn't connected (asleep or off) · "
+                       "the mirror picks it back up when it returns", TOAST_WARN_MS)
+        elif has_source and not had_source:
+            self.toast(f"Monitor {self.settings['source']} is back · {self._status()}")
 
     def on_a_monitor(self, x, y):
         return any(m["left"] <= x < m["left"] + m["width"] and
@@ -1076,6 +1337,8 @@ class App:
         if key in ("pip_corner", "target"):
             s["pip_pos"] = None                # back to a preset position
         s[key] = value
+        if key in ("source", "target"):
+            self._remember_monitor_rects()
         if key in ("source", "target", "engine"):
             self.capturer.reset()
             self.mirror.base = None
@@ -1092,7 +1355,8 @@ class App:
 
     def toggle_startup(self):
         try:
-            set_startup(not startup_enabled())
+            # blocked in Task Manager counts as off: clicking turns it back on properly
+            set_startup(not (startup_enabled() and not startup_blocked()))
             self.toast("Will start with Windows" if startup_enabled() else "Won't start with Windows")
         except OSError as e:
             self.toast(f"Couldn't change the startup setting: {e}", TOAST_WARN_MS)
@@ -1215,10 +1479,12 @@ class App:
                 Item(self._engine_status, lambda icon, item: None, enabled=False),
             )),
             Menu.SEPARATOR,
-            Item("Start with Windows",
+            Item(lambda item: ("Start with Windows  (turned off in Task Manager - click to fix)"
+                               if startup_enabled() and startup_blocked() else "Start with Windows"),
                  lambda icon, item: self.post(self.toggle_startup),
-                 checked=lambda item: startup_enabled()),
+                 checked=lambda item: startup_enabled() and not startup_blocked()),
             Item("Open settings file", lambda icon, item: self.post(self.open_settings)),
+            Item("Open log folder", lambda icon, item: os.startfile(DATA_DIR)),
             Item("View on GitHub", lambda icon, item: webbrowser.open(REPO_URL)),
             Menu.SEPARATOR,
             Item("Quit", lambda icon, item: self.post(self.quit)),
@@ -1255,7 +1521,12 @@ class App:
             while True:
                 kind, payload = self.events.get_nowait()
                 if kind == "call":
-                    payload()
+                    try:
+                        payload()
+                    except Exception as e:
+                        log.exception("Command failed")
+                        self.toast(f"Something went wrong: {e} · details in the log folder",
+                                   TOAST_WARN_MS)
                 elif kind == "hotkey-failed":
                     self.mirror._refresh_chrome()
                     self.icon.update_menu()
@@ -1265,20 +1536,28 @@ class App:
                                "You can still use the tray icon.", TOAST_WARN_MS)
         except queue.Empty:
             pass
-        self.root.after(50, self._poll)
+        except Exception:
+            log.exception("Event loop error")
+        finally:
+            self.root.after(50, self._poll)
 
     def run(self):
-        threading.Thread(target=hotkey_listener, args=(self,), daemon=True).start()
-        threading.Thread(target=self.icon.run, daemon=True).start()
+        threading.Thread(target=hotkey_listener, args=(self,), name="hotkeys", daemon=True).start()
+        threading.Thread(target=self.icon.run, name="tray", daemon=True).start()
         self._poll()
         self.root.after(300, lambda: self.toast(
-            f"{APP_NAME} v{APP_VERSION} running · {TOGGLE_KEY} to show Monitor {self.settings['source']}"))
+            f"{APP_NAME} v{APP_VERSION} running · {TOGGLE_KEY} to show Monitor {self.settings['source']}"
+            if self.monitor(self.settings["source"]) else
+            f"{APP_NAME} v{APP_VERSION} running · mirrored monitor not connected yet"))
+        self.root.after(2000, self._watch_displays)
         self.root.mainloop()
 
 
 def main():
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument("--list", action="store_true", help="list monitors and exit")
+    parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--startup", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     make_dpi_aware()
@@ -1291,17 +1570,23 @@ def main():
                       f"   GPU capture: {'yes' if gpu else 'no'}")
         return
 
+    setup_logging()
+    log.info("Monitor Mirror v%s starting (Python %s, GPU capture %s)", APP_VERSION,
+             sys.version.split()[0], "available" if HAVE_DXCAM else "not installed")
+
     if not acquire_single_instance():
+        log.warning("Another copy is running and didn't hand over; exiting")
         user32.MessageBoxW(
             None,
-            "An older version of Monitor Mirror is still running.\n\n"
-            "Right-click its tray icon, choose Quit, then open this file again.\n"
-            "(From now on, opening a newer version replaces the running one automatically.)",
+            "Another copy of Monitor Mirror is running and didn't close.\n\n"
+            "Right-click its tray icon, choose Quit, then open this file again.",
             APP_NAME, 0x40)
         return
 
+    repair_startup_entry()
     atexit.register(lambda: clip_cursor(None))   # never leave the cursor trapped
     App().run()
+    log.info("Monitor Mirror quit")
 
 
 if __name__ == "__main__":
